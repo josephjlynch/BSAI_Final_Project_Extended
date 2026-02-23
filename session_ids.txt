@@ -1,0 +1,87 @@
+# Allen Brain Observatory Visual Behavior Neuropixels
+# 65 Valid Session IDs (after exclusion criteria)
+# 
+# Original Selection Criteria (BSAI_Final_Project):
+#   - V1 neurons >= 20
+#   - LM neurons >= 30
+#   - n_natural_stim > 1000 (excludes placeholder sessions)
+#
+# Extended Project (BSAI_Final_Project_Extended):
+#   These same 65 sessions are used. Additional areas (RL, AL, PM, AM)
+#   are loaded where available. Not all sessions have neurons in all 6
+#   visual areas. Areas with fewer than min_neurons (default 5) good
+#   units are excluded per-session at runtime -- no sessions are dropped.
+#
+# Per-area coverage is computed at runtime by scanning sessions.
+# Run load_session_data() to see per-session area counts.
+#
+# Exclusion: 10 sessions with incomplete processing (placeholder values)
+#
+# Data Source: https://portal.brain-map.org/explore/circuits
+# Citation: Siegle et al. (2021) Nature 592:86-92
+#
+1053709239
+1053718935
+1053925378
+1053941483
+1055221968
+1055240613
+1055403683
+1055415082
+1062755779
+1063010385
+1064400234
+1064415305
+1064639378
+1064644573
+1065437523
+1065449881
+1065905010
+1065908084
+1067588044
+1067781390
+1069461581
+1071300149
+1081090969
+1081429294
+1081431006
+1086200042
+1086410738
+1087720624
+1091039376
+1091039902
+1092466205
+1093642839
+1093864136
+1093867806
+1095138995
+1095340643
+1096620314
+1096935816
+1098119201
+1099598937
+1099869737
+1104058216
+1104289498
+1104297538
+1105543760
+1105798776
+1108334384
+1108335514
+1108528422
+1108531612
+1109889304
+1111013640
+1111216934
+1112302803
+1112515874
+1115086689
+1115356973
+1115368723
+1116941914
+1117148442
+1118324999
+1118327332
+1118508667
+1118512505
+1119946360
