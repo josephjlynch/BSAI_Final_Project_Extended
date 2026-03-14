@@ -1,10 +1,9 @@
 # BSAI Final Project Extended
-# Stimulus-Dependent Functional Network Topology in Mouse Visual Cortex
-#
-# Extended to all six visual areas: V1, LM, RL, AL, PM, AM
+# Network Mechanisms of Visual Change Detection in Mouse Cortex
 #
 # Source modules:
-#   data_loading  - Allen SDK data access for 6 visual areas
-#   connectivity  - Within-area and cross-area Pearson correlation matrices
-#   graph_metrics - NetworkX graph construction and metric computation
+#   constants     - Analysis parameters (Bennett et al. 2025)
+#   data_loading  - Allen SDK data access, quality filtering, trial parsing
+#   connectivity  - CCG-based directed connectivity (replaces Pearson)
+#   graph_metrics - NetworkX DiGraph metrics
 #   statistics    - Paired t-tests, Cohen's d, permutation tests, bootstrap CIs
