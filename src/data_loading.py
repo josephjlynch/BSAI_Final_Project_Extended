@@ -6,9 +6,14 @@ Loads and filters neurons from Allen Visual Behavior Neuropixels dataset
 across all six mouse visual cortex areas (+ optional subcortical).
 
 QUALITY FILTER (Bennett et al. 2025, Methods §Data processing):
+  quality == 'good' (non-noise) AND
   presence_ratio > 0.9, isi_violations < 0.5, amplitude_cutoff < 0.1
+
+Week 2 gate diagnostic confirmed: 3 criteria alone = 82,133 units;
+adding quality=='good' = 76,602 (0.67% from Bennett's 76,091).
 """
 
+import os
 import warnings
 
 import numpy as np
@@ -18,7 +23,8 @@ from typing import Dict, Tuple, List, Optional
 from .constants import (
     PRESENCE_RATIO_MIN, ISI_VIOLATIONS_MAX, AMPLITUDE_CUTOFF_MAX,
     EXPECTED_UNIT_COUNT, RS_FS_THRESHOLD_MS, ENGAGEMENT_REWARD_RATE_MIN,
-    N_SESSIONS_EXPECTED, N_MICE_EXPECTED, RANDOM_SEED
+    N_SESSIONS_EXPECTED, N_MICE_EXPECTED, RANDOM_SEED,
+    CCG_MIN_FIRING_RATE_HZ
 )
 
 
@@ -34,9 +40,15 @@ AREA_NAMES = {
 
 THALAMIC_AREAS = ['LGd', 'LP']
 MIDBRAIN_AREAS = ['SCm', 'MRN']
-HIPPOCAMPAL_AREAS = ['CA1', 'CA3', 'DG']
+HIPPOCAMPAL_AREAS = ['CA1', 'CA3', 'DG', 'ProS', 'SUB']
 SUBCORTICAL_AREAS = THALAMIC_AREAS + MIDBRAIN_AREAS
 ALL_TARGET_AREAS = VISUAL_AREAS + SUBCORTICAL_AREAS
+
+OTHER_SUBCORTICAL_AREAS = ['MG', 'APN', 'MB']
+ALL_BENNETT_AREAS = (
+    VISUAL_AREAS + THALAMIC_AREAS + MIDBRAIN_AREAS
+    + HIPPOCAMPAL_AREAS + OTHER_SUBCORTICAL_AREAS
+)
 
 THALAMIC_NAMES = {'LGd': 'LGN', 'LP': 'LP'}
 MIDBRAIN_NAMES = {'SCm': 'SC', 'MRN': 'MRN'}
@@ -116,26 +128,25 @@ def get_units_with_areas(cache, session_id: int, quality_filter: bool = True) ->
     IMPORTANT: session.get_units() does NOT have area column.
     Must use cache.get_unit_table() and filter by session_id.
     
-    Quality filter uses Bennett et al. (2025) criteria:
-      presence_ratio > 0.9, isi_violations < 0.5, amplitude_cutoff < 0.1
+    Quality filter uses Bennett et al. (2025) criteria (Methods §Data processing):
+      quality == 'good' (i.e., non-noise) AND
+      presence_ratio > 0.9 AND isi_violations < 0.5 AND amplitude_cutoff < 0.1
     
-    Args:
-        cache: Allen cache object
-        session_id: Ecephys session ID
-        quality_filter: If True, apply Bennett's three quality criteria
-        
-    Returns:
-        DataFrame with unit info including 'structure_acronym' and 'waveform_type'
+    Week 2 gate diagnostic confirmed all four filters are required to
+    match Bennett's 76,091 count (we get 76,602, 0.67% difference).
     """
     unit_table = cache.get_unit_table()
     session_units = unit_table[unit_table['ecephys_session_id'] == session_id].copy()
     
     if quality_filter:
-        session_units = session_units[
+        mask = (
             (session_units['presence_ratio'] > PRESENCE_RATIO_MIN) &
             (session_units['isi_violations'] < ISI_VIOLATIONS_MAX) &
             (session_units['amplitude_cutoff'] < AMPLITUDE_CUTOFF_MAX)
-        ].copy()
+        )
+        if 'quality' in session_units.columns:
+            mask = mask & (session_units['quality'] == 'good')
+        session_units = session_units[mask].copy()
     
     session_units = classify_unit_waveform_type(session_units)
     
@@ -312,6 +323,36 @@ def filter_engaged_trials(
     return stim[stim['reward_rate'] >= min_reward_rate].copy()
 
 
+def label_sdt_category(trials: pd.DataFrame) -> pd.DataFrame:
+    """Add unified sdt_category column from boolean SDT columns.
+
+    Bennett's task: aborted trials (lick before change) restart and never
+    appear in the trials table.  Rows where no boolean is True are
+    auto-rewarded or edge-case trials, NOT aborted trials.
+    """
+    trials = trials.copy()
+    cats = ['hit', 'miss', 'false_alarm', 'correct_reject']
+
+    present = [c for c in cats if c in trials.columns]
+    if not present:
+        trials['sdt_category'] = 'unknown'
+        return trials
+
+    bool_sum = trials[present].sum(axis=1)
+    multi = bool_sum > 1
+    if multi.any():
+        warnings.warn(
+            f"{multi.sum()} trials have multiple SDT booleans True. "
+            "Using priority order: hit > miss > false_alarm > correct_reject."
+        )
+
+    trials['sdt_category'] = 'auto_reward_or_other'
+    for cat in reversed(present):
+        trials.loc[trials[cat] == True, 'sdt_category'] = cat
+
+    return trials
+
+
 def get_change_detection_trials(
     session,
     engaged_only: bool = True
@@ -347,17 +388,19 @@ def get_change_detection_trials(
     }
     
     trials = session.trials.copy()
-    result['trials'] = trials
+    result['trials'] = label_sdt_category(trials)
     
     if engaged_only and 'reward_rate' in stim.columns:
         trial_reward = stim.groupby('trials_id')['reward_rate'].first() if 'trials_id' in stim.columns else pd.Series(dtype=float)
         if len(trial_reward) > 0:
             engaged_trial_ids = trial_reward[trial_reward >= ENGAGEMENT_REWARD_RATE_MIN].index
-            result['engaged_trials'] = trials[trials.index.isin(engaged_trial_ids)]
+            result['engaged_trials'] = label_sdt_category(
+                trials[trials.index.isin(engaged_trial_ids)]
+            )
         else:
-            result['engaged_trials'] = trials
+            result['engaged_trials'] = label_sdt_category(trials)
     else:
-        result['engaged_trials'] = trials
+        result['engaged_trials'] = label_sdt_category(trials)
     
     return result
 
@@ -560,6 +603,73 @@ def compute_firing_rates_by_area(
             print(f"  Warning: no valid stimulus periods for {ALL_AREA_NAMES.get(area, area)}, skipping")
     
     return rates_by_area
+
+
+# =============================================================================
+# PRE-EXTRACTED SPIKE TIME LOADER (Week 3+)
+# =============================================================================
+
+def load_extracted_spike_times(
+    session_id: int,
+    derivatives_dir: str = 'results/derivatives/spike_times',
+    ccg_only: bool = False,
+) -> Tuple[Dict[int, np.ndarray], pd.DataFrame]:
+    """Load pre-extracted spike times into dict format for connectivity.py.
+
+    Reads NPZ files written by extract_spike_times.py and returns the
+    spike-times dict expected by spike_times_to_trial_tensor() plus a
+    unit metadata DataFrame.
+
+    Parameters
+    ----------
+    session_id : int
+        Ecephys session ID.
+    derivatives_dir : str
+        Directory containing per-session NPZ files.
+    ccg_only : bool
+        If True, return only units with ccg_eligible==True (>= 2Hz).
+        If False, return all quality-filtered units.
+
+    Returns
+    -------
+    spike_dict : dict
+        {unit_id (int): spike_times_array_in_seconds (np.ndarray)}
+    unit_meta : pd.DataFrame
+        Columns: unit_id, area, waveform_type, firing_rate_session_hz, ccg_eligible
+    """
+    path = os.path.join(derivatives_dir, f'{session_id}.npz')
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No extracted spike times for session {session_id}. "
+            f"Expected: {path}"
+        )
+
+    data = np.load(path, allow_pickle=True)
+    unit_ids = data['unit_ids']
+    spike_times_arr = data['spike_times']
+    areas = data['areas']
+    waveform_types = data['waveform_types']
+    fr_session = data['firing_rates_session_hz']
+    ccg_eligible = data['ccg_eligible']
+
+    unit_meta = pd.DataFrame({
+        'unit_id': unit_ids,
+        'area': areas,
+        'waveform_type': waveform_types,
+        'firing_rate_session_hz': fr_session,
+        'ccg_eligible': ccg_eligible,
+    })
+
+    if ccg_only:
+        mask = ccg_eligible.astype(bool)
+    else:
+        mask = np.ones(len(unit_ids), dtype=bool)
+
+    spike_dict = {}
+    for idx in np.where(mask)[0]:
+        spike_dict[int(unit_ids[idx])] = spike_times_arr[idx]
+
+    return spike_dict, unit_meta[mask].reset_index(drop=True)
 
 
 # =============================================================================

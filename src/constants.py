@@ -34,13 +34,29 @@ RATE_BIN_SIZE_MS = 50.0
 
 # =============================================================================
 # CROSS-CORRELOGRAM (CCG) PARAMETERS
+# Sourced from: Tang, Disheng et al. (2024) Nature Communications ccg_library.py
+# https://github.com/HChoiLab/functional-network
 # =============================================================================
 
-CCG_BIN_SIZE_MS = 0.5
-CCG_WINDOW_MS = 50
-CCG_N_SURROGATES = 1000
-CCG_JITTER_WINDOW_MS = 25
-CCG_SIGNIFICANCE_PERCENTILE = 99.9
+CCG_BIN_SIZE_MS = 1.0          # 1ms bins (Disheng's implementation)
+CCG_WINDOW_BINS = 100          # lag window in bins (= 100ms at 1ms bins, one-sided 0→+100ms)
+CCG_WINDOW_MS = CCG_WINDOW_BINS * CCG_BIN_SIZE_MS  # 100ms
+
+# Jitter: pattern jitter (Harrison & Geman 2009), history-preserving
+CCG_N_SURROGATES = 100         # num_jitter in ccg_library.py default
+CCG_JITTER_WINDOW_BINS = 25    # L parameter (jitter window in bins = 25ms)
+CCG_JITTER_MEMORY = False      # memory=False: simple spike jitter (not history-preserving)
+CCG_N_SIGMA = 5.0              # significance threshold in z-score units
+
+# CCG epoch definitions (Disheng feedback: separate stimulus from gray screen)
+CCG_STIMULUS_EPOCH_MS = 250    # stimulus window only (primary analysis)
+CCG_GRAY_EPOCH_MS = 500        # gray screen window (secondary, optional)
+
+# CCG unit inclusion (Disheng feedback + Tang et al. 2024 Methods):
+# "only neurons with a firing rate of at least 2 Hz during all stimuli"
+CCG_MIN_FIRING_RATE_HZ = 2.0
+
+# Peak classification (retained for connection typing, consistent with Bennett)
 MONOSYNAPTIC_PEAK_WIDTH_MS = 2.0
 COMMON_INPUT_PEAK_WIDTH_MS = 5.0
 
@@ -64,6 +80,15 @@ EXPECTED_UNIT_COUNT = 76091
 # =============================================================================
 
 ENGAGEMENT_REWARD_RATE_MIN = 2.0  # rewards per minute threshold
+
+# =============================================================================
+# BEHAVIORAL STRATEGY (Piet et al. 2023)
+# Classification: visual comparison vs. timing estimation strategy
+# =============================================================================
+
+STRATEGY_INDEX_THRESHOLD = 0.5  # visual > 0.5, timing <= 0.5
+STRATEGY_MIN_TRIALS = 20        # minimum engaged trials for reliable logistic fit
+ANTICIPATORY_WINDOW_S = 0.5     # gray screen duration before each stimulus (500ms)
 
 # =============================================================================
 # SESSION / MOUSE COUNTS (Bennett dataset)
