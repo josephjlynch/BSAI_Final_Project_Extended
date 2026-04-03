@@ -13,7 +13,9 @@ Week 2 gate diagnostic confirmed: 3 criteria alone = 82,133 units;
 adding quality=='good' = 76,602 (0.67% from Bennett's 76,091).
 """
 
+import json
 import os
+import urllib.request
 import warnings
 
 import numpy as np
@@ -24,7 +26,10 @@ from .constants import (
     PRESENCE_RATIO_MIN, ISI_VIOLATIONS_MAX, AMPLITUDE_CUTOFF_MAX,
     EXPECTED_UNIT_COUNT, RS_FS_THRESHOLD_MS, ENGAGEMENT_REWARD_RATE_MIN,
     N_SESSIONS_EXPECTED, N_MICE_EXPECTED, RANDOM_SEED,
-    CCG_MIN_FIRING_RATE_HZ
+    CCG_MIN_FIRING_RATE_HZ, CORTICAL_LAYER_BOUNDARIES_NORM,
+    SUBCORTICAL_LAYER_LABEL, UNKNOWN_LAYER_LABEL,
+    CCF_ANNOTATION_URL, CCF_ANNOTATION_PATH,
+    CCF_ONTOLOGY_URL, CCF_ONTOLOGY_PATH, CCF_RESOLUTION_UM,
 )
 
 
@@ -151,6 +156,336 @@ def get_units_with_areas(cache, session_id: int, quality_filter: bool = True) ->
     session_units = classify_unit_waveform_type(session_units)
     
     return session_units
+
+
+def _assign_cortical_layer_heuristic(
+    units: pd.DataFrame,
+    visual_areas: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """Heuristic fallback: assign layers via per-session-area normalized depth.
+
+    WARNING: This normalizes DV CCF within each session x area, which can
+    misassign layers if the probe does not span full cortical depth. Use the
+    atlas-registered ``assign_cortical_layer()`` when the CCF annotation
+    volume is available.
+    """
+    if visual_areas is None:
+        visual_areas = VISUAL_AREAS
+
+    units = units.copy()
+    if 'structure_acronym' not in units.columns:
+        raise ValueError("assign_cortical_layer requires 'structure_acronym' column")
+
+    units['cortical_layer'] = SUBCORTICAL_LAYER_LABEL
+    visual_mask = units['structure_acronym'].isin(visual_areas)
+    units.loc[units['structure_acronym'] == 'grey', 'cortical_layer'] = UNKNOWN_LAYER_LABEL
+    units.loc[units['structure_acronym'].isin(['VIS', 'VISrll']), 'cortical_layer'] = UNKNOWN_LAYER_LABEL
+
+    if not visual_mask.any():
+        return units
+
+    depth_col = None
+    if 'dorsal_ventral_ccf_coordinate' in units.columns:
+        visual_dv = units.loc[visual_mask, 'dorsal_ventral_ccf_coordinate']
+        nan_frac = float(visual_dv.isna().mean()) if len(visual_dv) else 1.0
+        if nan_frac <= 0.20:
+            depth_col = 'dorsal_ventral_ccf_coordinate'
+    if depth_col is None and 'probe_vertical_position' in units.columns:
+        depth_col = 'probe_vertical_position'
+    if depth_col is None:
+        units.loc[visual_mask, 'cortical_layer'] = UNKNOWN_LAYER_LABEL
+        return units
+
+    units['depth_norm'] = np.nan
+    for area in visual_areas:
+        area_mask = units['structure_acronym'] == area
+        if not area_mask.any():
+            continue
+        depth_vals = pd.to_numeric(units.loc[area_mask, depth_col], errors='coerce')
+        valid = depth_vals.dropna()
+        if valid.empty:
+            units.loc[area_mask, 'cortical_layer'] = UNKNOWN_LAYER_LABEL
+            continue
+        d_min, d_max = float(valid.min()), float(valid.max())
+        if np.isclose(d_max, d_min):
+            units.loc[area_mask, 'cortical_layer'] = UNKNOWN_LAYER_LABEL
+            continue
+        norm = (depth_vals - d_min) / (d_max - d_min)
+        units.loc[area_mask, 'depth_norm'] = norm
+        units.loc[area_mask, 'cortical_layer'] = UNKNOWN_LAYER_LABEL
+        for layer, (low, high) in CORTICAL_LAYER_BOUNDARIES_NORM.items():
+            if layer == 'L6':
+                layer_mask = area_mask & norm.ge(low) & norm.le(high)
+            else:
+                layer_mask = area_mask & norm.ge(low) & norm.lt(high)
+            units.loc[layer_mask, 'cortical_layer'] = layer
+
+    units.loc[visual_mask & units['depth_norm'].isna(), 'cortical_layer'] = UNKNOWN_LAYER_LABEL
+    return units
+
+
+# =============================================================================
+# CCF ATLAS-REGISTERED LAMINAR ASSIGNMENT
+# =============================================================================
+
+def _download_if_missing(url: str, path: str) -> None:
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    print(f"Downloading {os.path.basename(path)} ({url}) ...")
+    urllib.request.urlretrieve(url, path)
+    print(f"  saved to {path}")
+
+
+def _build_ccf_layer_lookup(ontology: dict) -> dict:
+    """Map Allen structure IDs to cortical layer labels for visual areas.
+
+    Sorts areas longest-first to avoid prefix collisions (e.g. VISpm
+    matching VISp before VISpm is checked).
+
+    L6a and L6b are both mapped to 'L6'. See CORTICAL_LAYER_L6_SUBLAYERS_MERGED
+    in src/constants.py for rationale.
+    """
+    layer_map: Dict[int, str] = {}
+    sorted_areas = sorted(VISUAL_AREAS, key=len, reverse=True)
+    layer_suffixes = {
+        '1': 'L2/3', '2/3': 'L2/3',
+        '4': 'L4', '5': 'L5',
+        '6a': 'L6', '6b': 'L6',
+    }
+    for sid_str, struct in ontology.items():
+        sid = int(sid_str)
+        acronym = struct.get('acronym', '')
+        for area in sorted_areas:
+            if not acronym.startswith(area):
+                continue
+            suffix = acronym[len(area):]
+            if suffix in layer_suffixes:
+                layer_map[sid] = layer_suffixes[suffix]
+            break
+    return layer_map
+
+
+def load_ccf_annotation() -> Tuple[np.ndarray, dict, dict, int]:
+    """Load CCF annotation volume and build structure-to-layer lookup.
+
+    Downloads the 25 um Allen CCF annotation NRRD and the structure
+    ontology JSON on first call (files are cached on disk).
+
+    Returns
+    -------
+    annotation_vol : np.ndarray  (AP, DV, LR) uint32
+    layer_lookup   : dict  {structure_id: layer_label}
+    ontology_map   : dict  {structure_id: acronym_string}
+    resolution     : int   voxel size in micrometers
+    """
+    import nrrd
+
+    _download_if_missing(CCF_ANNOTATION_URL, CCF_ANNOTATION_PATH)
+    _download_if_missing(CCF_ONTOLOGY_URL, CCF_ONTOLOGY_PATH)
+
+    annotation_vol, _ = nrrd.read(CCF_ANNOTATION_PATH)
+
+    with open(CCF_ONTOLOGY_PATH) as f:
+        raw = json.load(f)
+    ontology = {str(s['id']): s for s in raw['msg']}
+
+    layer_lookup = _build_ccf_layer_lookup(ontology)
+    ontology_map = {int(s['id']): s.get('acronym', '') for s in raw['msg']}
+    return annotation_vol, layer_lookup, ontology_map, CCF_RESOLUTION_UM
+
+
+def _compute_depth_norm(
+    units: pd.DataFrame,
+    visual_mask: pd.Series,
+    visual_areas: List[str],
+) -> pd.DataFrame:
+    """Per-area DV normalization to populate depth_norm for atlas-path units."""
+    if 'dorsal_ventral_ccf_coordinate' not in units.columns:
+        return units
+    for area in visual_areas:
+        area_mask = units['structure_acronym'] == area
+        if not area_mask.any():
+            continue
+        dv = pd.to_numeric(
+            units.loc[area_mask, 'dorsal_ventral_ccf_coordinate'],
+            errors='coerce',
+        )
+        valid = dv.dropna()
+        if len(valid) < 2:
+            continue
+        d_min, d_max = float(valid.min()), float(valid.max())
+        if np.isclose(d_min, d_max):
+            continue
+        units.loc[area_mask, 'depth_norm'] = (dv - d_min) / (d_max - d_min)
+    return units
+
+
+def assign_cortical_layer(
+    units: pd.DataFrame,
+    visual_areas: Optional[List[str]] = None,
+    annotation_vol: Optional[np.ndarray] = None,
+    layer_lookup: Optional[dict] = None,
+    resolution: int = CCF_RESOLUTION_UM,
+    ontology_map: Optional[dict] = None,
+) -> Tuple[pd.DataFrame, str]:
+    """Atlas-registered laminar assignment using the 3-D CCF annotation volume.
+
+    For each visual-area unit with valid (AP, DV, LR) CCF coordinates, looks
+    up the Allen structure ID in the annotation volume and maps it to a
+    cortical layer.  When the initial voxel resolves to a non-target adjacent
+    structure, a ±1-voxel (3×3×3) neighborhood search restricted to the
+    unit's own area recovers border units.
+
+    Falls back to the per-session normalized-depth heuristic when the
+    annotation volume is not supplied.
+
+    Returns
+    -------
+    units : pd.DataFrame
+        Input DataFrame with ``cortical_layer`` and ``depth_norm`` columns.
+    method : str
+        ``'atlas'`` or ``'heuristic'``.
+    """
+    if visual_areas is None:
+        visual_areas = VISUAL_AREAS
+
+    units = units.copy()
+    units['cortical_layer'] = SUBCORTICAL_LAYER_LABEL
+    units.loc[
+        units['structure_acronym'] == 'grey', 'cortical_layer'
+    ] = UNKNOWN_LAYER_LABEL
+    units.loc[
+        units['structure_acronym'].isin(['VIS', 'VISrll']), 'cortical_layer'
+    ] = UNKNOWN_LAYER_LABEL
+    visual_mask = units['structure_acronym'].isin(visual_areas)
+
+    if not visual_mask.any():
+        return units, 'atlas' if annotation_vol is not None else 'heuristic'
+
+    ccf_cols = [
+        'anterior_posterior_ccf_coordinate',
+        'dorsal_ventral_ccf_coordinate',
+        'left_right_ccf_coordinate',
+    ]
+    has_ccf = all(c in units.columns for c in ccf_cols)
+
+    if has_ccf and annotation_vol is not None and layer_lookup is not None:
+        units['depth_norm'] = np.nan
+
+        vis_idx = units.index[visual_mask]
+        ccf_raw = (
+            units.loc[vis_idx, ccf_cols]
+            .apply(pd.to_numeric, errors='coerce')
+            .values
+        )
+
+        nan_mask = np.isnan(ccf_raw).any(axis=1)
+        ccf_ijk = np.zeros_like(ccf_raw, dtype=np.int64)
+        ccf_ijk[~nan_mask] = np.round(
+            ccf_raw[~nan_mask] / resolution
+        ).astype(np.int64)
+
+        shape = annotation_vol.shape
+        oob_mask = (
+            nan_mask
+            | (ccf_ijk[:, 0] < 0) | (ccf_ijk[:, 0] >= shape[0])
+            | (ccf_ijk[:, 1] < 0) | (ccf_ijk[:, 1] >= shape[1])
+            | (ccf_ijk[:, 2] < 0) | (ccf_ijk[:, 2] >= shape[2])
+        )
+        valid_mask = ~oob_mask
+
+        struct_ids = np.zeros(len(vis_idx), dtype=np.int64)
+        struct_ids[valid_mask] = annotation_vol[
+            ccf_ijk[valid_mask, 0],
+            ccf_ijk[valid_mask, 1],
+            ccf_ijk[valid_mask, 2],
+        ].astype(np.int64)
+
+        layer_arr = pd.Series(struct_ids, index=vis_idx).map(
+            lambda sid: layer_lookup.get(int(sid))
+        )
+        units.loc[vis_idx, 'cortical_layer'] = layer_arr.fillna(
+            UNKNOWN_LAYER_LABEL
+        ).values
+        units.loc[vis_idx[oob_mask], 'cortical_layer'] = UNKNOWN_LAYER_LABEL
+
+        # ---- Neighborhood search for still-unknown border units ----------
+        #   Vectorised: build all 26 neighbour offsets, batch-lookup their
+        #   structure IDs, and assign the first valid match per unit.
+        if ontology_map is not None:
+            still_unknown = (
+                (units.loc[vis_idx, 'cortical_layer'] == UNKNOWN_LAYER_LABEL)
+                & valid_mask
+                & (struct_ids != 0)
+            )
+            unk_idx = vis_idx[still_unknown]
+            if len(unk_idx) > 0:
+                offsets = np.array(
+                    [[da, dd, dl]
+                     for da in (-1, 0, 1)
+                     for dd in (-1, 0, 1)
+                     for dl in (-1, 0, 1)
+                     if not (da == 0 and dd == 0 and dl == 0)],
+                    dtype=np.int64,
+                )  # (26, 3)
+
+                pos_in_vis = np.searchsorted(vis_idx, unk_idx)
+                base_ijk = ccf_ijk[pos_in_vis]  # (U, 3)
+                U = len(unk_idx)
+
+                nbr = (base_ijk[:, np.newaxis, :]
+                       + offsets[np.newaxis, :, :])  # (U, 26, 3)
+
+                in_bounds = (
+                    (nbr[:, :, 0] >= 0) & (nbr[:, :, 0] < shape[0])
+                    & (nbr[:, :, 1] >= 0) & (nbr[:, :, 1] < shape[1])
+                    & (nbr[:, :, 2] >= 0) & (nbr[:, :, 2] < shape[2])
+                )
+                nbr_clipped = np.clip(
+                    nbr,
+                    0,
+                    np.array(shape, dtype=np.int64)[np.newaxis, np.newaxis, :] - 1,
+                )
+                nbr_sids = annotation_vol[
+                    nbr_clipped[:, :, 0],
+                    nbr_clipped[:, :, 1],
+                    nbr_clipped[:, :, 2],
+                ].astype(np.int64)
+                nbr_sids[~in_bounds] = 0
+
+                areas_arr = units.loc[unk_idx, 'structure_acronym'].values
+                for u in range(U):
+                    row_area = areas_arr[u]
+                    for nb in range(26):
+                        nsid = int(nbr_sids[u, nb])
+                        if nsid == 0:
+                            continue
+                        nlayer = layer_lookup.get(nsid)
+                        if nlayer is not None:
+                            nacr = ontology_map.get(nsid, '')
+                            if nacr.startswith(row_area):
+                                units.at[unk_idx[u],
+                                         'cortical_layer'] = nlayer
+                                break
+
+        units = _compute_depth_norm(units, visual_mask, visual_areas)
+        return units, 'atlas'
+
+    result = _assign_cortical_layer_heuristic(units, visual_areas)
+    return result, 'heuristic'
+
+
+def get_inhibitory_subtype(genotype: Optional[str]) -> Optional[str]:
+    """Return session-level interneuron line tag from genotype string."""
+    if genotype is None or pd.isna(genotype):
+        return None
+    g = str(genotype)
+    if 'Sst-IRES-Cre' in g:
+        return 'SST'
+    if 'Vip-IRES-Cre' in g:
+        return 'VIP'
+    return None
 
 
 def get_area_neurons(
@@ -670,6 +1005,19 @@ def load_extracted_spike_times(
         spike_dict[int(unit_ids[idx])] = spike_times_arr[idx]
 
     return spike_dict, unit_meta[mask].reset_index(drop=True)
+
+
+def load_annotated_units(
+    session_id: int,
+    derivatives_dir: str = 'results/derivatives/unit_tables',
+) -> pd.DataFrame:
+    """Load per-session annotated unit table produced in Week 5."""
+    path = os.path.join(derivatives_dir, f'{session_id}.parquet')
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No annotated unit table for session {session_id}. Expected: {path}"
+        )
+    return pd.read_parquet(path)
 
 
 # =============================================================================

@@ -66,6 +66,41 @@ COMMON_INPUT_PEAK_WIDTH_MS = 5.0
 
 RS_FS_THRESHOLD_MS = 0.4  # trough-to-peak; >0.4 = RS (excitatory), <0.4 = FS (PV inhibitory)
 
+# Laminar depth assignment (Week 5)
+# Normalized cortical depth boundaries: 0 = pia, 1 = white matter.
+CORTICAL_LAYER_BOUNDARIES_NORM = {
+    'L2/3': (0.0, 0.35),
+    'L4': (0.35, 0.50),
+    'L5': (0.50, 0.75),
+    'L6': (0.75, 1.0),
+}
+SUBCORTICAL_LAYER_LABEL = 'subcortical'
+UNKNOWN_LAYER_LABEL = 'unknown'
+
+# L6 consolidation: Allen CCF ontology distinguishes L6a and L6b.
+# Both are mapped to 'L6' here because:
+#   (a) L6b contains too few units for reliable per-area statistics
+#       (~10% of L6 units across the 6 visual areas in this dataset)
+#   (b) Jia et al. 2022 and Tang et al. 2024 do not distinguish L6 sublaminae
+# If L6a/L6b separation is required for a specific analysis, change
+# layer_suffixes in _build_ccf_layer_lookup() to:
+#   '6a': 'L6a', '6b': 'L6b'
+# and update CORTICAL_LAYER_BOUNDARIES_NORM accordingly.
+CORTICAL_LAYER_L6_SUBLAYERS_MERGED = True
+
+# CCF annotation volume for atlas-registered laminar assignment
+CCF_ANNOTATION_URL = (
+    'http://download.alleninstitute.org/informatics-archive/'
+    'current-release/mouse_ccf/annotation/ccf_2017/annotation_25.nrrd'
+)
+CCF_ANNOTATION_PATH = 'data/allen_cache/ccf_annotation_25.nrrd'
+CCF_ONTOLOGY_URL = (
+    'http://api.brain-map.org/api/v2/data/Structure/query.json'
+    '?criteria=[graph_id$eq1]&num_rows=all'
+)
+CCF_ONTOLOGY_PATH = 'data/allen_cache/ccf_structure_tree.json'
+CCF_RESOLUTION_UM = 25
+
 # =============================================================================
 # UNIT QUALITY FILTERS (Bennett Methods, §Data processing)
 # =============================================================================
@@ -82,6 +117,14 @@ EXPECTED_UNIT_COUNT = 76091
 ENGAGEMENT_REWARD_RATE_MIN = 2.0  # rewards per minute threshold
 
 # =============================================================================
+# TRIAL-TYPE ALIGNMENT
+# =============================================================================
+
+MAX_LABELED_REPEAT_POSITION = 4   # positions 1-4 labeled; 5+ lumped as "5plus"
+GLM_HISTORY_LAGS = 10             # 10-lag outcome history (Molano-Mazón Eq. 3)
+RESET_INDEX_MIN_TRIALS = 30       # min after-hit/after-miss trials for RI
+
+# =============================================================================
 # BEHAVIORAL STRATEGY (Piet et al. 2023)
 # Classification: visual comparison vs. timing estimation strategy
 # =============================================================================
@@ -89,6 +132,20 @@ ENGAGEMENT_REWARD_RATE_MIN = 2.0  # rewards per minute threshold
 STRATEGY_INDEX_THRESHOLD = 0.5  # visual > 0.5, timing <= 0.5
 STRATEGY_MIN_TRIALS = 20        # minimum engaged trials for reliable logistic fit
 ANTICIPATORY_WINDOW_S = 0.5     # gray screen duration before each stimulus (500ms)
+
+# =============================================================================
+# Piet et al. (2023) dynamic logistic regression / licking segmentation
+# =============================================================================
+LICK_BOUT_ILI_S = 0.700  # inter-lick interval threshold for bout segmentation
+
+# PsyTrack random-walk prior hyperparameter search bounds (guardrails).
+# (psytrack.hyperOpt performs unconstrained optimization in log2 space.)
+PSYTRACK_SIGMA_BOUNDS = (1e-4, 1e4)
+
+# Timing strategy sigmoid parameters:
+# images since the end of the last licking bout, mapped through a sigmoid.
+TIMING_SIGMOID_MIDPOINT = 4
+TIMING_SIGMOID_SLOPE = 1.0
 
 # =============================================================================
 # SESSION / MOUSE COUNTS (Bennett dataset)
